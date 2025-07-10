@@ -1,0 +1,24 @@
+# fly.toml app configuration file generated for fast-socks on 2025-03-21T15:38:24+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'fast-socks'
+primary_region = 'lhr'
+
+[[services]]
+  internal_port = 1337
+  protocol = "udp"
+
+  [[services.ports]]
+    port = "1337"
+
+[[services]]
+  internal_port = 1337
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = "1337"
+
+[[vm]]
+  size = 'shared-cpu-1x'
