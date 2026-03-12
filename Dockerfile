@@ -18,4 +18,5 @@ COPY --from=builder /app/target/release/fast_socks /usr/local/bin/socks5-server
 # Expose the port if your application listens on one (adjust port as necessary)
 EXPOSE 1337
 # Set the entrypoint to your binaryy
-CMD ["socks5-server", "--listen-addr", "0.0.0.0:1337", "no-auth"]
+# CMD ["socks5-server", "--listen-addr", "0.0.0.0:1337", "no-auth"]
+CMD ["socks5-server", "--listen-addr", "0.0.0.0:1399", "no-auth"]
