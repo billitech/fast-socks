@@ -8,9 +8,15 @@ use fast_socks5::{
     server::{DnsResolveHelper as _, Socks5ServerProtocol, run_tcp_proxy, run_udp_proxy},
 };
 use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
 use structopt::StructOpt;
 use tokio::net::TcpListener;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio::task;
+use tokio::time::sleep;
+use tokio::time::timeout;
 
 /// # How to use it:
 ///
@@ -39,6 +45,18 @@ struct Opt {
     /// Request timeout in seconds
     #[structopt(short = "t", long, default_value = "10")]
     pub request_timeout: u64,
+
+    /// Maximum time to wait for a client to finish the SOCKS handshake
+    #[structopt(long, default_value = "10")]
+    pub handshake_timeout: u64,
+
+    /// Maximum number of concurrent client sessions to allow
+    #[structopt(long, default_value = "256")]
+    pub max_connections: usize,
+
+    /// Maximum lifetime in seconds for an established TCP proxy session
+    #[structopt(long, default_value = "1800")]
+    pub session_timeout: u64,
 
     /// Authentication mode (subcommand)
     #[structopt(subcommand, name = "auth")]
@@ -87,42 +105,87 @@ async fn spawn_socks_server() -> Result<()> {
     }
 
     let listener = TcpListener::bind(&opt.listen_addr).await?;
+    let connection_limit = Arc::new(Semaphore::new(opt.max_connections));
     info!("Listening for SOCKS connections at {}", &opt.listen_addr);
 
     loop {
         match listener.accept().await {
-            Ok((socket, _client_addr)) => {
-                spawn_and_log_error(serve_socks5(opt, socket));
+            Ok((socket, client_addr)) => {
+                let permit = match connection_limit.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        warn!(
+                            "Rejecting connection from {} because {} active sessions are already in use",
+                            client_addr, opt.max_connections
+                        );
+                        continue;
+                    }
+                };
+
+                spawn_and_log_error(serve_socks5(opt, socket, client_addr, permit));
             }
             Err(err) => {
                 error!("Accept error: {:?}", err);
+                if err.raw_os_error() == Some(24) {
+                    sleep(Duration::from_millis(250)).await;
+                }
             }
         }
     }
 }
 
-async fn serve_socks5(opt: &Opt, socket: tokio::net::TcpStream) -> Result<(), SocksError> {
-    let (proto, cmd, target_addr) = match &opt.auth {
-        AuthMode::NoAuth if opt.skip_auth => {
-            Socks5ServerProtocol::skip_auth_this_is_not_rfc_compliant(socket)
+async fn serve_socks5(
+    opt: &Opt,
+    socket: tokio::net::TcpStream,
+    client_addr: std::net::SocketAddr,
+    _permit: OwnedSemaphorePermit,
+) -> Result<(), SocksError> {
+    let handshake = async {
+        let (proto, cmd, target_addr) = match &opt.auth {
+            AuthMode::NoAuth if opt.skip_auth => {
+                Socks5ServerProtocol::skip_auth_this_is_not_rfc_compliant(socket)
+            }
+            AuthMode::NoAuth => Socks5ServerProtocol::accept_no_auth(socket).await?,
+            AuthMode::Password { username, password } => {
+                Socks5ServerProtocol::accept_password_auth(socket, |user, pass| {
+                    user == *username && pass == *password
+                })
+                .await?
+                .0
+            }
         }
-        AuthMode::NoAuth => Socks5ServerProtocol::accept_no_auth(socket).await?,
-        AuthMode::Password { username, password } => {
-            Socks5ServerProtocol::accept_password_auth(socket, |user, pass| {
-                user == *username && pass == *password
-            })
-            .await?
-            .0
-        }
-    }
-    .read_command()
-    .await?
-    .resolve_dns()
-    .await?;
+        .read_command()
+        .await?
+        .resolve_dns()
+        .await?;
+
+        Ok::<_, SocksError>((proto, cmd, target_addr))
+    };
+
+    let (proto, cmd, target_addr) = timeout(Duration::from_secs(opt.handshake_timeout), handshake)
+        .await
+        .map_err(|_| {
+            SocksError::Other(anyhow::anyhow!(
+                "client handshake from {} timed out after {}s",
+                client_addr,
+                opt.handshake_timeout
+            ))
+        })??;
 
     match cmd {
         Socks5Command::TCPConnect => {
-            run_tcp_proxy(proto, &target_addr, opt.request_timeout, false).await?;
+            timeout(
+                Duration::from_secs(opt.session_timeout),
+                run_tcp_proxy(proto, &target_addr, opt.request_timeout, false),
+            )
+            .await
+            .map_err(|_| {
+                SocksError::Other(anyhow::anyhow!(
+                    "tcp proxy session for {} timed out after {}s",
+                    client_addr,
+                    opt.session_timeout
+                ))
+            })??;
         }
         Socks5Command::UDPAssociate if opt.allow_udp => {
             let reply_ip = opt.public_addr.context("invalid reply ip")?;
@@ -133,6 +196,8 @@ async fn serve_socks5(opt: &Opt, socket: tokio::net::TcpStream) -> Result<(), So
             return Err(ReplyError::CommandNotSupported.into());
         }
     };
+
+    info!("Closed session for {}", client_addr);
     Ok(())
 }
 
